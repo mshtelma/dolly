@@ -1,4 +1,5 @@
 # Copyright 2023 Databricks, Inc.
+import json
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +14,19 @@
 # limitations under the License.
 
 import logging
+import math
+import os
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
 import click
+import deepspeed
 import numpy as np
 from datasets import Dataset, load_dataset
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from deltatorch import create_pytorch_dataloader, FieldSpec
+from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -28,9 +35,13 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+    get_scheduler,
+    WEIGHTS_NAME,
 )
+import torch
+from transformers.deepspeed import is_deepspeed_zero3_enabled
 
-from .consts import (
+from training.consts import (
     DEFAULT_INPUT_MODEL,
     DEFAULT_SEED,
     PROMPT_WITH_INPUT_FORMAT,
@@ -46,7 +57,9 @@ ROOT_PATH = Path(__file__).parent.parent
 
 
 class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
-    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+    def torch_call(
+        self, examples: List[Union[List[int], Any, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
         batch = super().torch_call(examples)
 
         # The prompt ends with the response key plus a newline.  We encode this and then try to find it in the
@@ -56,15 +69,15 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
         labels = batch["labels"].clone()
 
         for i in range(len(examples)):
-
             response_token_ids_start_idx = None
             for idx in np.where(batch["labels"][i] == response_token_ids[0])[0]:
                 response_token_ids_start_idx = idx
                 break
 
             if response_token_ids_start_idx is None:
+                original_text = self.tokenizer.decode(batch["labels"][i])
                 raise RuntimeError(
-                    f'Could not find response key {response_token_ids} in token IDs {batch["labels"][i]}'
+                    f'Could not find response key {response_token_ids} in token IDs {batch["labels"][i]}\n\n {original_text}'
                 )
 
             response_token_ids_end_idx = response_token_ids_start_idx + 1
@@ -77,75 +90,70 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
         return batch
 
 
-def preprocess_batch(batch: Dict[str, List], tokenizer: AutoTokenizer, max_length: int) -> dict:
-    return tokenizer(
-        batch["text"],
-        max_length=max_length,
-        truncation=True,
-    )
-
-
-def load_training_dataset(path_or_dataset: str = DEFAULT_TRAINING_DATASET) -> Dataset:
-    logger.info(f"Loading dataset from {path_or_dataset}")
-    dataset = load_dataset(path_or_dataset)["train"]
-    logger.info("Found %d rows", dataset.num_rows)
-
-    def _add_text(rec):
-        instruction = rec["instruction"]
-        response = rec["response"]
-        context = rec.get("context")
-
-        if not instruction:
-            raise ValueError(f"Expected an instruction in: {rec}")
-
-        if not response:
-            raise ValueError(f"Expected a response in: {rec}")
-
-        # For some instructions there is an input that goes along with the instruction, providing context for the
-        # instruction.  For example, the input might be a passage from Wikipedia and the instruction says to extract
-        # some piece of information from it.  The response is that information to extract.  In other cases there is
-        # no input.  For example, the instruction might be open QA such as asking what year some historic figure was
-        # born.
-        if context:
-            rec["text"] = PROMPT_WITH_INPUT_FORMAT.format(instruction=instruction, response=response, input=context)
-        else:
-            rec["text"] = PROMPT_NO_INPUT_FORMAT.format(instruction=instruction, response=response)
-        return rec
-
-    dataset = dataset.map(_add_text)
-
-    return dataset
-
-
-def load_tokenizer(pretrained_model_name_or_path: str = DEFAULT_INPUT_MODEL) -> PreTrainedTokenizer:
+def load_tokenizer(
+    pretrained_model_name_or_path: str = DEFAULT_INPUT_MODEL,
+) -> PreTrainedTokenizer:
     logger.info(f"Loading tokenizer for {pretrained_model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({"additional_special_tokens": [END_KEY, INSTRUCTION_KEY, RESPONSE_KEY_NL]})
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": [END_KEY, INSTRUCTION_KEY, RESPONSE_KEY_NL]}
+    )
     return tokenizer
 
 
 def load_model(
-    pretrained_model_name_or_path: str = DEFAULT_INPUT_MODEL, *, gradient_checkpointing: bool = False
+    pretrained_model_name_or_path: str = DEFAULT_INPUT_MODEL,
+    *,
+    gradient_checkpointing: bool = False,
 ) -> AutoModelForCausalLM:
     logger.info(f"Loading model for {pretrained_model_name_or_path}")
     model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True, use_cache=False if gradient_checkpointing else True
+        pretrained_model_name_or_path,
+        trust_remote_code=True,
+        use_cache=False if gradient_checkpointing else True,
     )
     return model
 
 
 def get_model_tokenizer(
-    pretrained_model_name_or_path: str = DEFAULT_INPUT_MODEL, *, gradient_checkpointing: bool = False
+    pretrained_model_name_or_path: str = DEFAULT_INPUT_MODEL,
+    *,
+    gradient_checkpointing: bool = False,
 ) -> Tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
     tokenizer = load_tokenizer(pretrained_model_name_or_path)
-    model = load_model(pretrained_model_name_or_path, gradient_checkpointing=gradient_checkpointing)
+    model = load_model(
+        pretrained_model_name_or_path, gradient_checkpointing=gradient_checkpointing
+    )
     model.resize_token_embeddings(len(tokenizer))
 
     return model, tokenizer
 
 
-def preprocess_dataset(tokenizer: AutoTokenizer, max_length: int, seed=DEFAULT_SEED, training_dataset: str = DEFAULT_TRAINING_DATASET) -> Dataset:
+def preprocess_batch(
+    item: Dict[str, Any], tokenizer: AutoTokenizer, max_length: int
+) -> dict:
+    tokenized_result = tokenizer(
+        item["text"],
+        max_length=max_length,
+        truncation=True,
+        padding=True,
+        return_tensors="pt",
+    )
+    item = {}
+    item["input_ids"] = tokenized_result["input_ids"][0][:max_length]
+    item["attention_mask"] = tokenized_result["attention_mask"][0][:max_length]
+
+    return item
+
+
+def preprocess_dataset(
+    tokenizer: AutoTokenizer,
+    max_length: int,
+    dataset_path: str,
+    batch_size: int = 8,
+    collate_fn=None,
+) -> DataLoader:
     """Loads the training dataset and tokenizes it so it is ready for training.
 
     Args:
@@ -155,28 +163,72 @@ def preprocess_dataset(tokenizer: AutoTokenizer, max_length: int, seed=DEFAULT_S
     Returns:
         Dataset: HuggingFace dataset
     """
-
-    dataset = load_training_dataset(training_dataset)
-
-    logger.info("Preprocessing dataset")
-    _preprocessing_function = partial(preprocess_batch, max_length=max_length, tokenizer=tokenizer)
-    dataset = dataset.map(
-        _preprocessing_function,
-        batched=True,
-        remove_columns=["instruction", "context", "response", "text", "category"],
+    _preprocessing_function = partial(
+        preprocess_batch, max_length=max_length, tokenizer=tokenizer
     )
 
-    # Make sure we don't have any truncated records, as this would mean the end keyword is missing.
-    logger.info("Processed dataset has %d rows", dataset.num_rows)
-    dataset = dataset.filter(lambda rec: len(rec["input_ids"]) < max_length)
-    logger.info("Processed dataset has %d rows after filtering for truncated records", dataset.num_rows)
+    return create_pytorch_dataloader(
+        dataset_path,
+        id_field="id",
+        fields=[
+            FieldSpec("text", full_record_transform=_preprocessing_function),
+        ],
+        shuffle=True,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+    )
 
-    logger.info("Shuffling dataset")
-    dataset = dataset.shuffle(seed=seed)
 
-    logger.info("Done preprocessing")
+def to_device(batch, device):
+    output = {}
+    for k, v in batch.items():
+        try:
+            output[k] = v.to(device)
+        except:
+            output[k] = v
+    return output
 
-    return dataset
+
+def get_optimizer_grouped_parameters(
+    model, weight_decay, no_decay_name_list=["bias", "LayerNorm.weight"]
+):
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if (not any(nd in n for nd in no_decay_name_list) and p.requires_grad)
+            ],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if (any(nd in n for nd in no_decay_name_list) and p.requires_grad)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+    return optimizer_grouped_parameters
+
+
+def save_hf_format(model, tokenizer, output_dir="/local_disk0/model"):
+    model_to_save = model.module if hasattr(model, "module") else model
+    tokenizer.save_pretrained(output_dir)
+    model_to_save.save_pretrained(output_dir)
+    if is_deepspeed_zero3_enabled():
+        file = os.path.join(output_dir, WEIGHTS_NAME)
+        if os.path.isfile(file):
+            os.remove(file)
+
+        if not model.save_16bit_model(output_dir, WEIGHTS_NAME):
+            logger.warning(
+                "deepspeed.save_16bit_model didn't save the model, since"
+                " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
+                " zero_to_fp32.py to recover weights"
+            )
+            model.save_checkpoint(output_dir)
 
 
 def train(
@@ -184,34 +236,46 @@ def train(
     input_model: str,
     local_output_dir: str,
     dbfs_output_dir: str,
+    train_path: str,
+    test_path: str,
     epochs: int,
     per_device_train_batch_size: int,
     per_device_eval_batch_size: int,
     lr: float,
     seed: int,
-    deepspeed: str,
+    offload: bool,
+    deepspeed_conf: str,
     gradient_checkpointing: bool,
     local_rank: str,
-    bf16: bool,
-    logging_steps: int,
-    save_steps: int,
-    eval_steps: int,
-    test_size: Union[float, int],
-    save_total_limit: int,
     warmup_steps: int,
-    training_dataset: str = DEFAULT_TRAINING_DATASET,
 ):
     set_seed(seed)
+    local_rank = int(local_rank)
+    if local_rank == -1:
+        device = torch.device("cuda")
+    else:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        deepspeed.init_distributed()
 
     model, tokenizer = get_model_tokenizer(
-        pretrained_model_name_or_path=input_model, gradient_checkpointing=gradient_checkpointing
+        pretrained_model_name_or_path=input_model,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+
+    gradient_accumulation_steps = 1
+    with open(deepspeed_conf) as json_data:
+        ds_config = json.load(json_data)
+    ds_config["train_micro_batch_size_per_gpu"] = per_device_train_batch_size
+    ds_config["train_batch_size"] = (
+        per_device_train_batch_size
+        * torch.distributed.get_world_size()
+        * gradient_accumulation_steps
     )
 
     # Use the same max length that the model supports.  Fall back to 1024 if the setting can't be found.
     # The configuraton for the length can be stored under different names depending on the model.  Here we attempt
     # a few possible names we've encountered.
-    conf = model.config
-    max_length = None
     for length_setting in ["n_positions", "max_position_embeddings", "seq_length"]:
         max_length = getattr(model.config, length_setting, None)
         if max_length:
@@ -221,92 +285,148 @@ def train(
         max_length = 1024
         logger.info(f"Using default max length: {max_length}")
 
-    processed_dataset = preprocess_dataset(tokenizer=tokenizer, max_length=max_length, seed=seed, training_dataset=training_dataset)
-
-    split_dataset = processed_dataset.train_test_split(test_size=test_size, seed=seed)
-
-    logger.info("Train data size: %d", split_dataset["train"].num_rows)
-    logger.info("Test data size: %d", split_dataset["test"].num_rows)
-
     data_collator = DataCollatorForCompletionOnlyLM(
-        tokenizer=tokenizer, mlm=False, return_tensors="pt", pad_to_multiple_of=8
+        tokenizer=tokenizer,
+        mlm=False,
+        return_tensors="pt",
+        pad_to_multiple_of=8,
     )
 
-    # enable fp16 if not bf16
-    fp16 = not bf16
-
-    if not dbfs_output_dir:
-        logger.warn("Will NOT save to DBFS")
-
-    training_args = TrainingArguments(
-        output_dir=local_output_dir,
-        per_device_train_batch_size=per_device_train_batch_size,
-        per_device_eval_batch_size=per_device_eval_batch_size,
-        fp16=fp16,
-        bf16=bf16,
-        learning_rate=lr,
-        num_train_epochs=epochs,
-        deepspeed=deepspeed,
-        gradient_checkpointing=gradient_checkpointing,
-        logging_dir=f"{local_output_dir}/runs",
-        logging_strategy="steps",
-        logging_steps=logging_steps,
-        evaluation_strategy="steps",
-        eval_steps=eval_steps,
-        save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=save_total_limit,
-        load_best_model_at_end=False,
-        report_to="tensorboard",
-        disable_tqdm=True,
-        remove_unused_columns=False,
-        local_rank=local_rank,
-        warmup_steps=warmup_steps,
+    train_dataloader = preprocess_dataset(
+        tokenizer,
+        max_length,
+        train_path,
+        batch_size=per_device_train_batch_size,
+        collate_fn=data_collator,
     )
+
+    optimizer_grouped_parameters = get_optimizer_grouped_parameters(model, 1)
+
+    AdamOptimizer = DeepSpeedCPUAdam if offload else FusedAdam
+    optimizer = AdamOptimizer(optimizer_grouped_parameters, lr=lr, betas=(0.9, 0.95))
+
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / gradient_accumulation_steps
+    )
+    lr_scheduler = get_scheduler(
+        name="cosine",  # lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=epochs * num_update_steps_per_epoch,
+    )
+
+    model, optimizer, _, lr_scheduler = deepspeed.initialize(
+        model=model,
+        optimizer=optimizer,
+        args={"local_rank": local_rank, "deepspeed_config": ds_config},
+        config=ds_config,
+        lr_scheduler=lr_scheduler,
+        dist_init_required=True,
+    )
+
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     logger.info("Instantiating Trainer")
 
-    trainer = Trainer(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        train_dataset=split_dataset["train"],
-        eval_dataset=split_dataset["test"],
-        data_collator=data_collator,
-    )
-
     logger.info("Training")
-    trainer.train()
-
-    logger.info(f"Saving Model to {local_output_dir}")
-    trainer.save_model(output_dir=local_output_dir)
+    for epoch in range(epochs):
+        model.train()
+        for step, batch in enumerate(train_dataloader):
+            batch = to_device(batch, device)
+            outputs = model(**batch, use_cache=False)
+            loss = outputs.loss
+            model.backward(loss)
+            model.step()
 
     if dbfs_output_dir:
-        logger.info(f"Saving Model to {dbfs_output_dir}")
-        trainer.save_model(output_dir=dbfs_output_dir)
+        logger.info(f"Saving Model to DBFS: {dbfs_output_dir}")
+        save_hf_format(model, tokenizer, dbfs_output_dir)
+
+    # if local_output_dir:
+    #     logger.info(f"Saving Model locally: {local_output_dir}")
+    #     save_hf_format(model, tokenizer, local_output_dir)
 
     logger.info("Done.")
 
 
 @click.command()
-@click.option("--input-model", type=str, help="Input model to fine tune", default=DEFAULT_INPUT_MODEL)
-@click.option("--local-output-dir", type=str, help="Write directly to this local path", required=True)
+@click.option(
+    "--input-model",
+    type=str,
+    help="Input model to fine tune",
+    default=DEFAULT_INPUT_MODEL,
+)
+@click.option(
+    "--train-path",
+    type=str,
+    help="Path to the Delta Table used for training",
+    required=True,
+)
+@click.option(
+    "--test-path",
+    type=str,
+    help="Path to the Delta Table used for training",
+    required=True,
+)
+@click.option(
+    "--local-output-dir",
+    type=str,
+    help="Write directly to this local path",
+    required=True,
+)
 @click.option("--dbfs-output-dir", type=str, help="Sync data to this path on DBFS")
 @click.option("--epochs", type=int, default=3, help="Number of epochs to train for.")
-@click.option("--per-device-train-batch-size", type=int, default=8, help="Batch size to use for training.")
-@click.option("--per-device-eval-batch-size", type=int, default=8, help="Batch size to use for evaluation.")
 @click.option(
-    "--test-size", type=int, default=1000, help="Number of test records for evaluation, or ratio of test records."
+    "--per-device-train-batch-size",
+    type=int,
+    default=8,
+    help="Batch size to use for training.",
 )
-@click.option("--warmup-steps", type=int, default=None, help="Number of steps to warm up to learning rate")
+@click.option(
+    "--per-device-eval-batch-size",
+    type=int,
+    default=8,
+    help="Batch size to use for evaluation.",
+)
+@click.option(
+    "--test-size",
+    type=int,
+    default=1000,
+    help="Number of test records for evaluation, or ratio of test records.",
+)
+@click.option(
+    "--warmup-steps",
+    type=int,
+    default=None,
+    help="Number of steps to warm up to learning rate",
+)
 @click.option("--logging-steps", type=int, default=10, help="How often to log")
-@click.option("--eval-steps", type=int, default=50, help="How often to run evaluation on test records")
-@click.option("--save-steps", type=int, default=400, help="How often to checkpoint the model")
-@click.option("--save-total-limit", type=int, default=10, help="Maximum number of checkpoints to keep on disk")
-@click.option("--lr", type=float, default=1e-5, help="Learning rate to use for training.")
-@click.option("--seed", type=int, default=DEFAULT_SEED, help="Seed to use for training.")
-@click.option("--deepspeed", type=str, default=None, help="Path to deepspeed config file.")
-@click.option("--training-dataset", type=str, default=DEFAULT_TRAINING_DATASET, help="Path to dataset for training")
+@click.option(
+    "--eval-steps",
+    type=int,
+    default=50,
+    help="How often to run evaluation on test records",
+)
+@click.option(
+    "--save-steps", type=int, default=400, help="How often to checkpoint the model"
+)
+@click.option(
+    "--save-total-limit",
+    type=int,
+    default=10,
+    help="Maximum number of checkpoints to keep on disk",
+)
+@click.option(
+    "--lr", type=float, default=1e-5, help="Learning rate to use for training."
+)
+@click.option(
+    "--seed", type=int, default=DEFAULT_SEED, help="Seed to use for training."
+)
+@click.option(
+    "--deepspeed_conf", type=str, default=None, help="Path to deepspeed config file."
+)
+@click.option("--offload", type=bool, default=False, help="Offload")
 @click.option(
     "--gradient-checkpointing/--no-gradient-checkpointing",
     is_flag=True,
@@ -315,18 +435,22 @@ def train(
 )
 @click.option(
     "--local_rank",
-    type=str,
+    type=int,
     default=True,
     help="Provided by deepspeed to identify which instance this process is when performing multi-GPU training.",
 )
-@click.option("--bf16", type=bool, default=None, help="Whether to use bf16 (preferred on A100's).")
+@click.option(
+    "--bf16", type=bool, default=None, help="Whether to use bf16 (preferred on A100's)."
+)
 def main(**kwargs):
     train(**kwargs)
 
 
 if __name__ == "__main__":
     logging.basicConfig(
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S"
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     try:
         main()

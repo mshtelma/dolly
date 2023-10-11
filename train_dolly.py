@@ -57,7 +57,9 @@
 import logging
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S"
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logging.getLogger("py4j").setLevel(logging.WARNING)
 logging.getLogger("sh.command").setLevel(logging.ERROR)
@@ -68,14 +70,15 @@ import os
 import re
 from datetime import datetime
 from training.consts import DEFAULT_INPUT_MODEL, SUGGESTED_INPUT_MODELS
-from training.trainer import load_training_dataset, load_tokenizer
 
-dbutils.widgets.combobox("input_model", DEFAULT_INPUT_MODEL, SUGGESTED_INPUT_MODELS, "input_model")
+dbutils.widgets.combobox(
+    "input_model", DEFAULT_INPUT_MODEL, SUGGESTED_INPUT_MODELS, "input_model"
+)
 dbutils.widgets.text("num_gpus", "", "num_gpus")
 dbutils.widgets.text("local_training_root", "", "local_training_root")
 dbutils.widgets.text("dbfs_output_root", "", "dbfs_output_root")
-dbutils.widgets.text("experiment_id", "", "experiment_id")
-dbutils.widgets.combobox("gpu_family", "a100", ["v100", "a10", "a100"])
+dbutils.widgets.text("experiment_id", "DOLLY_TEST", "experiment_id")
+dbutils.widgets.combobox("gpu_family", "a10", ["v100", "a10", "a100"])
 
 # COMMAND ----------
 
@@ -101,7 +104,9 @@ if not local_training_root:
         local_training_root = os.path.join("/local_disk0", dolly_training_dir_name)
     # Otherwise use the home directory.
     else:
-        local_training_root = os.path.join(os.path.expanduser('~'), dolly_training_dir_name)
+        local_training_root = os.path.join(
+            os.path.expanduser("~"), dolly_training_dir_name
+        )
 
 dbfs_output_root = dbutils.widgets.get("dbfs_output_root")
 if not dbfs_output_root:
@@ -152,23 +157,25 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # COMMAND ----------
 
-!deepspeed {num_gpus_flag} \
-    --module training.trainer \
-    --input-model {input_model} \
-    --deepspeed {deepspeed_config} \
-    --epochs 2 \
-    --local-output-dir {local_output_dir} \
-    --dbfs-output-dir {dbfs_output_dir} \
-    --per-device-train-batch-size {batch_size} \
-    --per-device-eval-batch-size {batch_size} \
-    --logging-steps 10 \
-    --save-steps 200 \
-    --save-total-limit 20 \
-    --eval-steps 50 \
-    --warmup-steps 50 \
-    --test-size 200 \
-    --lr 5e-6 \
-    {bf16_flag}
+# MAGIC !deepspeed {num_gpus_flag} \
+# MAGIC     --module training.trainer \
+# MAGIC     --input-model {input_model} \
+# MAGIC     --train-path /dbfs/tmp/msh/datasets/dolly/dolly_instr_test.delta \
+# MAGIC     --test-path /dbfs/tmp/msh/datasets/dolly/dolly_instr_test.delta \
+# MAGIC     --deepspeed_conf {deepspeed_config} \
+# MAGIC     --epochs 2 \
+# MAGIC     --local-output-dir {local_output_dir} \
+# MAGIC     --dbfs-output-dir {dbfs_output_dir} \
+# MAGIC     --per-device-train-batch-size {batch_size} \
+# MAGIC     --per-device-eval-batch-size {batch_size} \
+# MAGIC     --logging-steps 10 \
+# MAGIC     --save-steps 200 \
+# MAGIC     --save-total-limit 20 \
+# MAGIC     --eval-steps 50 \
+# MAGIC     --warmup-steps 50 \
+# MAGIC     --test-size 200 \
+# MAGIC     --lr 5e-6 \
+# MAGIC     {bf16_flag}
 
 # COMMAND ----------
 
@@ -188,18 +195,18 @@ instructions = [
 ]
 
 # set some additional pipeline args
-pipeline_kwargs = {'torch_dtype': "auto"}
+pipeline_kwargs = {"torch_dtype": "auto"}
 if gpu_family == "v100":
-    pipeline_kwargs['torch_dtype'] = "float16"
+    pipeline_kwargs["torch_dtype"] = "float16"
 elif gpu_family == "a10" or gpu_family == "a100":
-    pipeline_kwargs['torch_dtype'] = "bfloat16"
+    pipeline_kwargs["torch_dtype"] = "bfloat16"
 
 # Use the model to generate responses for each of the instructions above.
 for instruction in instructions:
-    response = generate_response(instruction, model=model, tokenizer=tokenizer, **pipeline_kwargs)
+    response = generate_response(
+        instruction, model=model, tokenizer=tokenizer, **pipeline_kwargs
+    )
     if response:
         print(f"Instruction: {instruction}\n\n{response}\n\n-----------\n")
 
 # COMMAND ----------
-
-

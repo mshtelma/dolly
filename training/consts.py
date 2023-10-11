@@ -6,12 +6,10 @@ SUGGESTED_INPUT_MODELS = [
     "EleutherAI/gpt-j-6B",
     "databricks/dolly-v2-3b",
     "databricks/dolly-v2-7b",
-    "databricks/dolly-v2-12b"
+    "databricks/dolly-v2-12b",
 ]
 DEFAULT_TRAINING_DATASET = "databricks/databricks-dolly-15k"
-INTRO_BLURB = (
-    "Below is an instruction that describes a task. Write a response that appropriately completes the request."
-)
+INTRO_BLURB = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
 INSTRUCTION_KEY = "### Instruction:"
 INPUT_KEY = "Input:"
 RESPONSE_KEY = "### Response:"

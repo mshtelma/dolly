@@ -33,7 +33,10 @@ dbutils.widgets.combobox("input_model", default_model, suggested_models, "input_
 
 # COMMAND ----------
 
-from training.generate import InstructionTextGenerationPipeline, load_model_tokenizer_for_generate
+from training.generate import (
+    InstructionTextGenerationPipeline,
+    load_model_tokenizer_for_generate,
+)
 
 input_model = dbutils.widgets.get("input_model")
 
@@ -45,19 +48,23 @@ from langchain import PromptTemplate, LLMChain
 from langchain.llms import HuggingFacePipeline
 
 # template for an instrution with no input
-prompt = PromptTemplate(
-    input_variables=["instruction"],
-    template="{instruction}")
+prompt = PromptTemplate(input_variables=["instruction"], template="{instruction}")
 
 # template for an instruction with input
 prompt_with_context = PromptTemplate(
     input_variables=["instruction", "context"],
-    template="{instruction}\n\nInput:\n{context}")
+    template="{instruction}\n\nInput:\n{context}",
+)
 
 hf_pipeline = HuggingFacePipeline(
     pipeline=InstructionTextGenerationPipeline(
         # Return the full text, because this is what the HuggingFacePipeline expects.
-        model=model, tokenizer=tokenizer, return_full_text=True, task="text-generation"))
+        model=model,
+        tokenizer=tokenizer,
+        return_full_text=True,
+        task="text-generation",
+    )
+)
 
 llm_chain = LLMChain(llm=hf_pipeline, prompt=prompt)
 llm_context_chain = LLMChain(llm=hf_pipeline, prompt=prompt_with_context)
@@ -86,7 +93,11 @@ context = (
     """has been called the "Father of his Country" for his manifold leadership in the nation's founding."""
 )
 
-instruction = "When did George Washinton serve as president of the Constitutional Convention?"
+instruction = (
+    "When did George Washinton serve as president of the Constitutional Convention?"
+)
 
 response = llm_context_chain.predict(instruction=instruction, context=context)
-print(f"Instruction: {instruction}\n\nContext:\n{context}\n\nResponse:\n{response}\n\n-----------\n")
+print(
+    f"Instruction: {instruction}\n\nContext:\n{context}\n\nResponse:\n{response}\n\n-----------\n"
+)

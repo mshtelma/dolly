@@ -31,7 +31,10 @@ dbutils.widgets.combobox("input_model", default_model, suggested_models, "input_
 
 # COMMAND ----------
 
-from training.generate import InstructionTextGenerationPipeline, load_model_tokenizer_for_generate
+from training.generate import (
+    InstructionTextGenerationPipeline,
+    load_model_tokenizer_for_generate,
+)
 
 input_model = dbutils.widgets.get("input_model")
 
@@ -39,7 +42,9 @@ model, tokenizer = load_model_tokenizer_for_generate(input_model)
 
 # COMMAND ----------
 
-generation_pipeline = InstructionTextGenerationPipeline(model=model, tokenizer=tokenizer)
+generation_pipeline = InstructionTextGenerationPipeline(
+    model=model, tokenizer=tokenizer
+)
 
 # Examples from https://www.databricks.com/blog/2023/03/24/hello-dolly-democratizing-magic-chatgpt-open-models.html
 instructions = [
